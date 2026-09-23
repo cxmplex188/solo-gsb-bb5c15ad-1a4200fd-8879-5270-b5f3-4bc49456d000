@@ -20,6 +20,11 @@
   / `nonce` / `signature`；服务按固定 JSON 规范化后用环境配置的 HMAC-SHA256
   密钥验签、限制时间偏差，并对 `key_id+nonce` 做有效窗口内防重放。验签通过后
   执行对应操作并**原样返回该操作的响应**。`/plan` 与 `/assemble` 行为不受影响。
+- `POST /safe-download-name`：解析上游 `Content-Disposition` 响应头，返回可
+  直接用作本地下载文件名的**单一安全名称**。优先采用符合 RFC 5987 的
+  `filename*`（支持 UTF-8 / ISO-8859-1 百分号编码），无效或缺失时回退到传统
+  `filename`；解码后剥离路径前缀（`/` 与 `\`）、控制字符及尾部点/空格，空名与
+  `.` / `..` 等危险名称一律拒绝，无法得到有效名称时返回 `422`。
 
 ## Docker 一键启动
 
@@ -456,6 +461,108 @@ envelope["signature"] = hmac.new(
 非法或业务校验失败的请求会回滚 nonce 占位，客户端修正后可用同一 nonce
 重试。重放已成功的 nonce 返回 `409`。
 
+### `POST /safe-download-name`
+
+解析上游响应头 `Content-Disposition`，产出可安全写入本地文件系统的单一
+文件名（不依赖任何环境变量，无需鉴权）。请求体只有一个字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `content_disposition` | 上游 `Content-Disposition` 响应头的**原始值**（长度 1–8192 字符） |
+
+调用示例（传统 `filename` 直接包含 UTF-8 名称，服务按 UTF-8 解码）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/safe-download-name \
+  -H 'Content-Type: application/json' \
+  --data-raw '{"content_disposition": "attachment; filename=\"报告-2026.pdf\""}'
+```
+
+响应：
+
+```json
+{
+  "filename": "报告-2026.pdf",
+  "source": "filename"
+}
+```
+
+使用 RFC 5987 `filename*`（百分号编码，优先级最高）时建议用代码构造请求
+（shell 中单引号与 RFC 值里的 `charset'language'` 分隔符容易混淆）：
+
+```python
+import json, urllib.request
+
+body = json.dumps({
+    "content_disposition":
+        "attachment; filename=\"report 2026.pdf\"; "
+        "filename*=utf-8''%E6%8A%A5%E5%91%8A-2026.pdf"
+}).encode()
+req = urllib.request.Request(
+    "http://127.0.0.1:8080/safe-download-name",
+    data=body, headers={"Content-Type": "application/json"},
+)
+print(urllib.request.urlopen(req).read().decode())
+# {"filename":"报告-2026.pdf","source":"filename*"}
+```
+
+成功响应（HTTP 200）中的 `source` 标明最终名称的来源：`"filename*"`
+（RFC 5987 扩展参数）或 `"filename"`（传统回退参数）。
+
+#### 解析与回退规则
+
+1. 头值按 RFC 6266 风格解析：`<disposition-type> *( ";" 参数 )`，参数名大小写
+   不敏感；支持 token 与 quoted-string 两种取值（含 `\"`、`\\` 等 quoted-pair
+   转义）；`attachment` / `inline` 之外的其他 disposition type 也可解析。
+2. **优先采用 `filename*`**：必须形如 `charset'language'value`——`charset` 仅
+   接受 `UTF-8` 与 `ISO-8859-1`（大小写不敏感），`language` 可为空或符合
+   language-tag 语法，`value` 由 attr-char 与严格的百分号字节（`%HH`）组成，
+   还原后的字节必须能按声明字符集成功解码。
+3. **回退到 `filename`**：`filename*` 缺失、字符集/百分号/语言标签/字节序列
+   非法，或解码结果清理后为空时，改用传统 `filename`；取值按 UTF-8 优先、
+   ISO-8859-1 兜底解码（兼容直接把 UTF-8 字节放进 quoted-string 的上游）。
+   出现多个 `filename` 时取第一个。
+4. 两者都无法得到有效名称时返回 `422`。
+
+#### 文件名清理规则
+
+解码后的候选名称依次经过以下处理，确保结果是不含路径信息的单一文件名：
+
+1. 删除全部控制字符（`0x00–0x1F` 与 DEL `0x7F`，包括 NUL、BEL 等）；
+2. 按 POSIX（`/`）与 Windows（`\`）分隔符切分，**只保留最后一段**，剥离任意
+   目录前缀（如 `../../etc/passwd` → `passwd`、
+   `C:\Windows\System32\drivers\etc\hosts` → `hosts`；百分号编码出来的
+   `%2F` / `%5C` 同样生效，如 `..%2F..%2Fevil.sh` → `evil.sh`）；
+3. 去除首尾空白，并循环剥离尾部的点与空格（Windows 资源管理器会忽略它们，
+   可用于制造歧义文件名，如 `report.pdf...   ` → `report.pdf`）；
+4. 结果为空、仅由空白组成，或仅由点构成（`.`、`..`、`...` 等）时视为危险
+   空名，候选作废（`filename*` 作废后仍可回退到 `filename`；都无效则 `422`）。
+   以点开头的正常隐藏文件名（如 `.bashrc`）不受影响。
+
+示例对照：
+
+| Content-Disposition 关键内容 | 200 响应 `filename` |
+| --- | --- |
+| `filename*=utf-8''%E4%B8%AD%E6%96%87.tar.gz` | `中文.tar.gz` |
+| `filename*=iso-8859-1''caf%E9.txt` | `café.txt` |
+| `filename=fallback.bin; filename*=utf-8''%zzbad`（filename* 非法→回退） | `fallback.bin` |
+| `filename="../../etc/passwd"` | `passwd` |
+| `filename="C:\\Windows\\System32\\hosts"` | `hosts` |
+| `filename="report.pdf...   "` | `report.pdf` |
+| `filename="a\x00b.txt"`（含 NUL） | `ab.txt` |
+| `filename=".."` / `filename=""` / 无 filename | `422` |
+
+无法得到有效名称时的错误响应：
+
+```json
+{"error": "no_safe_filename", "message": "Content-Disposition 中未提供有效的 filename* 或 filename，无法得到可安全使用的下载文件名"}
+```
+
+头值本身语法错误（折行 CR/LF、引号未闭合、参数缺少 `=`、取值既非 token 也非
+quoted-string、disposition type 缺失等）返回
+`{"error": "invalid_content_disposition", "message": ...}`。请求体字段缺失、
+为空、超长或类型错误则与其他端点一致返回 `422 invalid_request`。
+
 ## 错误响应
 
 业务请求/语义错误统一返回 HTTP `422`：
@@ -465,6 +572,10 @@ envelope["signature"] = hmac.new(
 - `/multipart-parse` 的分帧、头部、范围与 Base64 校验错误同样为 `422`，
   错误码与 `loc` 定位规则见上方 [`POST /multipart-parse`](#post-multipart-parse)
   一节；
+- `/safe-download-name` 在头值语法错误时返回
+  `{"error": "invalid_content_disposition", "message": ...}`，
+  在头值合法但解析/清理后无任何可用名称时返回
+  `{"error": "no_safe_filename", "message": ...}`；
 - `/plan` 范围不可满足：`{"error": "unsatisfiable", "message": ..., "range_index": ...}`；
 - `/assemble` 组装错误：`{"error": "<code>", "detail": [{"message": ..., "loc": ...}]}`，
   其中 `loc` 指向出错的字段路径（如 `contents[2].data_b64`、
@@ -516,4 +627,10 @@ envelope["signature"] = hmac.new(
 pip install -r requirements.txt
 export SECURE_REQUEST_KEYS='demo-key=0123456789abcdef0123456789abcdef'
 uvicorn app.main:app --reload --port 8080
+```
+
+运行测试（`TestClient` 随 `fastapi` 安装的 `starlette` 提供）：
+
+```
+python -m unittest discover -s tests
 ```

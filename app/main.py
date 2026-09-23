@@ -27,6 +27,13 @@ Content-Range 且各出现一次，拒绝折行/重复/未知头部等头部注�
 Content-Range 的 bytes 闭区间与对象总长度、part 字节长度与对象边界；
 各 part 的区间必须与期望 ranges 规范化后的区间一一对应（无缺段、多段、
 重复段），最后按期望 ranges 顺序返回每段的 Base64 内容。
+
+POST /safe-download-name 解析上游 Content-Disposition 头值，产出可直接
+用作本地下载文件名的单一名称：优先采用 RFC 5987 的 filename*（字符集
+仅接受 UTF-8 与 ISO-8859-1、百分号字节序列必须合法），其无效或缺失时
+回退到传统 filename（token 或 quoted-string，按 UTF-8 优先、ISO-8859-1
+兜底解码）；解码后剥离路径前缀（/ 与 \\）、全部控制字符以及尾部的点与
+空格，空名与 "."/".." 等危险名称一律拒绝，无法得到有效名称时返回 422。
 """
 
 from __future__ import annotations
@@ -1852,3 +1859,329 @@ def secure_request(raw: SecureRequest) -> JSONResponse:
         with _nonce_lock:
             _nonce_seen.pop(nonce_key, None)
     return response
+
+
+# --------------------------- /safe-download-name ---------------------------
+
+# RFC 7230 token（tchar），字节级匹配。
+_DISPO_TOKEN_RE = re.compile(rb"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+# RFC 5987 attr-char（value 中允许的非百分号字节）。
+_ATTR_CHAR_RE = re.compile(rb"^[!#$&+.^_`|~0-9A-Za-z-]+$")
+# filename* 取值的 charset（大小写不敏感）：仅接受 UTF-8 与 ISO-8859-1。
+_EXTENDED_CHARSETS = frozenset({"utf-8", "iso-8859-1"})
+# RFC 5987 language-tag：1*8ALPHA *( "-" 1*8alphanum )，可缺省。
+_LANGUAGE_TAG_RE = re.compile(r"^(?:[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*)?$")
+
+# 文件名清理时的路径分隔符：同时覆盖 POSIX("/") 与 Windows("\\") 风格。
+_PATH_SEPARATORS = re.compile(r"[\\/]")
+# C0 控制字符（0x00-0x1F）与 DEL（0x7F）；NUL 等也一并去除。
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+# Windows 会忽略尾部的点与空格；循环去除直至稳定，避免 "a . . " 之类变体。
+_TRAILING_DOT_SPACE_RE = re.compile(r"[ .]+$")
+# 仅由点构成的名称（""、"."、".."、"..." 等）一律视为危险名称。
+_ALL_DOTS_RE = re.compile(r"^\.+$")
+# 接受的 Content-Disposition 头值最大长度，抵御超长输入。
+_DOWNLOAD_HEADER_MAX_LENGTH = 8192
+
+
+class SafeDownloadNameRequest(BaseModel):
+    """解析上游 Content-Disposition 的请求。
+
+    content_disposition 为上游响应头 Content-Disposition 的原始值
+    （HTTP 头按 ISO-8859-1 在线传输；若调用方已按其他字符集解码为
+    str，服务会先尝试 ISO-8859-1 还原为字节，失败时按 UTF-8 还原）。
+    """
+
+    content_disposition: str = Field(
+        ...,
+        min_length=1,
+        max_length=_DOWNLOAD_HEADER_MAX_LENGTH,
+        description="上游 Content-Disposition 响应头的原始值",
+    )
+
+
+class SafeDownloadNameResponse(BaseModel):
+    filename: str = Field(..., description="去除路径前缀与危险字符后可安全使用的单一文件名")
+    source: Literal["filename*", "filename"] = Field(
+        ..., description="最终采用的参数来源：RFC 5987 的 filename* 或回退的 filename"
+    )
+
+
+class DownloadNameError(Exception):
+    """Content-Disposition 无法解析出安全文件名，统一对应 HTTP 422。"""
+
+    def __init__(self, message: str, code: str = "invalid_content_disposition"):
+        self.message = message
+        self.code = code
+        super().__init__(message)
+
+
+@app.exception_handler(DownloadNameError)
+async def download_name_error_handler(request: Request, exc: DownloadNameError):
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "message": exc.message},
+    )
+
+
+def _header_to_bytes(raw: str) -> bytes:
+    """把（可能被代理按 UTF-8 解码过的）头值还原为线上原始字节。
+
+    HTTP 头的线上编码是 ISO-8859-1；调用方若直接传入 latin-1 解码的字符串，
+    这里可逆还原为字节。若字符串含 U+00FF 以上字符（说明曾被按 UTF-8 解码），
+    则按 UTF-8 还原，保证 RFC 5987 的百分号字节与 quoted-string 内的 UTF-8
+    原始字节都能被正确解析。
+    """
+    try:
+        return raw.encode("iso-8859-1")
+    except UnicodeEncodeError:
+        return raw.encode("utf-8")
+
+
+def _parse_disposition_params(value: bytes) -> tuple[bytes, list[tuple[str, bytes]]]:
+    """解析 `disposition-type *( OWS ";" OWS parameter )`，返回 (type, 参数列表)。
+
+    参数顺序按出现顺序保留；语法结构错误（缺分号、参数名非 token、缺 "="、
+    值非 token/quoted-string、引号未闭合、quoted-pair 转义非法等）抛出
+    DownloadNameError。参数名按 ASCII 小写返回，值为词法还原后的字节
+    （quoted-string 已去引号并解析反斜杠转义）。
+    """
+    n = len(value)
+    pos = 0
+
+    def skip_ows(i: int) -> int:
+        while i < n and value[i : i + 1] in (b" ", b"\t"):
+            i += 1
+        return i
+
+    pos = skip_ows(pos)
+    start = pos
+    while pos < n and value[pos : pos + 1] not in (b";", b" ", b"\t"):
+        pos += 1
+    dtype = value[start:pos]
+    pos = skip_ows(pos)
+    if not _DISPO_TOKEN_RE.fullmatch(dtype):
+        raise DownloadNameError(
+            "Content-Disposition 的 disposition-type 缺失或不是合法 token"
+        )
+
+    params: list[tuple[str, bytes]] = []
+    while pos < n:
+        if value[pos : pos + 1] != b";":
+            raise DownloadNameError(
+                "Content-Disposition 参数之间必须以 ';' 分隔（发现非法字符）"
+            )
+        pos += 1
+        pos = skip_ows(pos)
+
+        # 参数名：token。
+        name_start = pos
+        while pos < n and value[pos : pos + 1] not in (b"=", b" ", b"\t", b";"):
+            pos += 1
+        name = value[name_start:pos]
+        pos = skip_ows(pos)
+        if not name or pos >= n or value[pos : pos + 1] != b"=":
+            raise DownloadNameError(
+                f"Content-Disposition 参数 {name.decode('ascii', 'replace')!r} 缺少 '='"
+            )
+        if not _DISPO_TOKEN_RE.fullmatch(name):
+            raise DownloadNameError(
+                f"Content-Disposition 参数名 {name.decode('ascii', 'replace')!r} 不是合法 token"
+            )
+        pos += 1
+        pos = skip_ows(pos)
+        if pos >= n:
+            raise DownloadNameError(
+                f"Content-Disposition 参数 {name.decode('ascii', 'replace')!r} 缺少取值"
+            )
+
+        # 参数值：token 或 quoted-string。
+        if value[pos : pos + 1] == b'"':
+            pos += 1
+            out = bytearray()
+            while True:
+                if pos >= n:
+                    raise DownloadNameError(
+                        "Content-Disposition 的 quoted-string 未闭合（缺少结尾 '\"'）"
+                    )
+                ch = value[pos]
+                if ch == 0x22:  # 引号收尾
+                    pos += 1
+                    break
+                if ch in (0x0D, 0x0A):
+                    raise DownloadNameError(
+                        "Content-Disposition 参数值不允许包含 CR/LF（拒绝折行与头部注入）"
+                    )
+                if ch == 0x5C:  # 反斜杠 quoted-pair
+                    pos += 1
+                    if pos >= n:
+                        raise DownloadNameError(
+                            "Content-Disposition 的 quoted-pair 转义被截断"
+                        )
+                    esc = value[pos]
+                    if not (0x20 <= esc <= 0x7E):
+                        raise DownloadNameError(
+                            "Content-Disposition 的 quoted-pair 只能转义可见 ASCII 字符"
+                        )
+                    out.append(esc)
+                    pos += 1
+                else:
+                    # qdtext：除 CR/LF 外的字节均保留。tab(0x09)、SP 及可见
+                    # ASCII 是 RFC 7230 允许的 qdtext；现实中大量上游直接把
+                    # UTF-8 等非 ASCII 字节（obs-text，0x80-0xFF）放进
+                    # quoted-string，原样保留交由解码阶段按 UTF-8/ISO-8859-1
+                    # 解释。NUL、BEL、DEL 等控制字符也原样保留，由清理阶段
+                    # 统一去除；只有 CR/LF 在此拒绝（折行/头部注入）。
+                    out.append(ch)
+                    pos += 1
+            pvalue = bytes(out)
+        else:
+            val_start = pos
+            while pos < n and value[pos : pos + 1] not in (b";", b" ", b"\t"):
+                pos += 1
+            pvalue = value[val_start:pos]
+            if not _DISPO_TOKEN_RE.fullmatch(pvalue):
+                raise DownloadNameError(
+                    "Content-Disposition 参数值既不是合法 token 也不是 quoted-string"
+                )
+
+        pos = skip_ows(pos)
+        params.append((name.decode("ascii").lower(), pvalue))
+
+    return bytes(dtype).lower(), params
+
+
+def _decode_extended_value(raw: bytes) -> str:
+    """严格按 RFC 5987 解码 filename* 的 ``charset'language'value``。
+
+    - 三段必须恰好以两个 ASCII 单引号分隔；
+    - charset 仅接受 UTF-8 与 ISO-8859-1（大小写不敏感）；
+    - language 必须匹配 language-tag 语法（可缺省）；
+    - value 由 attr-char 与百分号字节组成，百分号后必须紧跟两位十六进制数；
+    - 百分号还原后的字节必须能按 charset 成功解码（UTF-8 拒绝非法序列）。
+    """
+    parts = raw.split(b"'")
+    if len(parts) != 3:
+        raise DownloadNameError(
+            "filename* 必须形如 charset'language'value（单引号数量不为 2）"
+        )
+    charset_b, language_b, value_b = parts
+    try:
+        charset = charset_b.decode("ascii").lower()
+    except UnicodeDecodeError:
+        raise DownloadNameError("filename* 的 charset 不是 ASCII token")
+    if charset not in _EXTENDED_CHARSETS:
+        raise DownloadNameError(
+            f"filename* 的 charset {charset!r} 不受支持（仅接受 UTF-8 与 ISO-8859-1）"
+        )
+    try:
+        language = language_b.decode("ascii")
+    except UnicodeDecodeError:
+        raise DownloadNameError("filename* 的 language 不是 ASCII")
+    if not _LANGUAGE_TAG_RE.fullmatch(language):
+        raise DownloadNameError(f"filename* 的 language {language!r} 不符合 language-tag 语法")
+
+    out = bytearray()
+    i = 0
+    while i < len(value_b):
+        if value_b[i] == 0x25:  # '%'
+            hexpart = value_b[i + 1 : i + 3]
+            if not re.fullmatch(rb"[0-9A-Fa-f]{2}", hexpart):
+                raise DownloadNameError("filename* 的百分号转义后必须紧跟两位十六进制数")
+            out.append(int(hexpart, 16))
+            i += 3
+            continue
+        # 一段连续的 attr-char（不含 '%'）一次性校验。
+        j = i
+        while j < len(value_b) and value_b[j] != 0x25:
+            j += 1
+        segment = value_b[i:j]
+        if not _ATTR_CHAR_RE.fullmatch(segment):
+            raise DownloadNameError("filename* 的 value 含 attr-char 之外的原始字节")
+        out.extend(segment)
+        i = j
+
+    try:
+        return bytes(out).decode(charset)
+    except UnicodeDecodeError:
+        raise DownloadNameError(f"filename* 的字节序列无法按 {charset.upper()} 解码")
+
+
+def _decode_legacy_value(raw: bytes) -> str:
+    """解码传统 filename 的 token / quoted-string 取值。
+
+    线上头值以 ISO-8859-1 传输，但实践中大量上游直接放入 UTF-8 字节
+    （尤其 quoted-string 内的中文文件名）。优先按 UTF-8 严格解码，
+    失败时回落到 ISO-8859-1（逐字节可逆，永不失败），与浏览器常见行为一致。
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("iso-8859-1")
+
+
+def sanitize_download_name(decoded: str) -> str:
+    """把解码后的参数值清理为单一、安全的文件名；无有效名称时返回空串。
+
+    步骤：去除全部控制字符（含 NUL/DEL）→ 去除首尾空白 → 按 ``/`` 与
+    ``\\`` 取最后一段（剥离任意路径前缀）→ 循环剥离尾部点/空格（Windows
+    会忽略它们，可用于歧义绕过）→ 拒绝空名与仅由点构成的名称。
+    """
+    cleaned = _CONTROL_CHARS_RE.sub("", decoded).strip()
+    base = _PATH_SEPARATORS.split(cleaned)[-1].strip()
+    while True:
+        newer = _TRAILING_DOT_SPACE_RE.sub("", base).strip()
+        if newer == base:
+            break
+        base = newer
+    if not base or _ALL_DOTS_RE.fullmatch(base):
+        return ""
+    return base
+
+
+def derive_download_name(raw: str) -> tuple[str, str]:
+    """解析原始 Content-Disposition 头值，返回 (安全文件名, 来源)。
+
+    按参数出现顺序选择：第一个语法合法且清理后非空的 `filename*`
+    （RFC 5987）一旦出现即优先采用；`filename*` 缺失或无效时，回退到第一个
+    清理后非空的 `filename`。同名参数重复时只看第一次出现（后续重复忽略）。
+    两者都无法得到有效名称时抛 DownloadNameError（HTTP 422）。
+    """
+    if any(ch in raw for ch in "\r\n"):
+        raise DownloadNameError(
+            "Content-Disposition 头值不允许包含 CR/LF（拒绝折行与头部注入）"
+        )
+    _, params = _parse_disposition_params(_header_to_bytes(raw))
+
+    extended: str | None = None  # 首个有效 filename*
+    extended_seen = False  # 是否出现过 filename*（即使首个非法也不再看后续重复项）
+    legacy: str | None = None  # 首个有效 filename（回退用）
+    for name, pvalue in params:
+        if name == "filename*":
+            if extended_seen:
+                continue  # 重复参数：只认第一次出现
+            extended_seen = True
+            try:
+                extended = sanitize_download_name(_decode_extended_value(pvalue)) or None
+            except DownloadNameError:
+                extended = None
+        elif name == "filename" and legacy is None:
+            # 重复参数只取第一个；清理后为空则视为无效。
+            legacy = sanitize_download_name(_decode_legacy_value(pvalue)) or None
+
+    if extended is not None:
+        return extended, "filename*"
+    if legacy is not None:
+        return legacy, "filename"
+    raise DownloadNameError(
+        "Content-Disposition 中未提供有效的 filename* 或 filename，"
+        "无法得到可安全使用的下载文件名",
+        code="no_safe_filename",
+    )
+
+
+@app.post("/safe-download-name", response_model=SafeDownloadNameResponse)
+def safe_download_name(req: SafeDownloadNameRequest) -> SafeDownloadNameResponse:
+    """解析上游 Content-Disposition，返回去除路径与危险字符后的单一文件名。"""
+    filename, source = derive_download_name(req.content_disposition)
+    return SafeDownloadNameResponse(filename=filename, source=source)
