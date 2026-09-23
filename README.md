@@ -20,6 +20,12 @@
   / `nonce` / `signature`；服务按固定 JSON 规范化后用环境配置的 HMAC-SHA256
   密钥验签、限制时间偏差，并对 `key_id+nonce` 做有效窗口内防重放。验签通过后
   执行对应操作并**原样返回该操作的响应**。`/plan` 与 `/assemble` 行为不受影响。
+- `POST /safe-download-name`：解析上游 `Content-Disposition` 响应头，返回可安全
+  用于保存下载内容的**单一文件名**。优先采用 RFC 5987 的 `filename*`
+  （`UTF-8` / `ISO-8859-1` 百分号解码），其缺失或无效时回退到传统 `filename`
+  （token / quoted-string）；解码后去除控制字符、POSIX/Windows 路径前缀（含盘符、
+  UNC）并裁剪空白，拒绝空名与 `.`/`..`。两者都无法得到有效名称或头部结构非法
+  时返回 `422`。
 
 ## Docker 一键启动
 
@@ -456,6 +462,88 @@ envelope["signature"] = hmac.new(
 非法或业务校验失败的请求会回滚 nonce 占位，客户端修正后可用同一 nonce
 重试。重放已成功的 nonce 返回 `409`。
 
+### `POST /safe-download-name`
+
+把上游响应中的 `Content-Disposition` 头**原始取值**（不含头部名与冒号）原样
+提交，服务返回一个可直接用于下载保存的单一文件名：
+
+```json
+{
+  "content_disposition": "attachment; filename=\"report.bin\"; filename*=utf-8''%E4%B8%AD%E6%96%87%E6%8A%A5%E5%91%8A.pdf"
+}
+```
+
+响应：
+
+```json
+{
+  "filename": "中文报告.pdf",
+  "source": "filename_star",
+  "sanitized": false
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `filename` | 清理后的单一文件名（不含任何目录、盘符与控制字符） |
+| `source` | 名称来源：`filename_star`（RFC 5987 `filename*`）或 `filename`（传统参数） |
+| `sanitized` | 解码后的原始名称是否经过清理（删除控制字符 / 去除路径前缀 / 裁剪空白） |
+
+调用示例（`filename*` 中的两个单引号用双引号包裹整个 `-d` 参数即可）：
+
+```
+curl -s -X POST http://127.0.0.1:8080/safe-download-name \
+  -H 'Content-Type: application/json' \
+  -d "{\"content_disposition\": \"attachment; filename*=utf-8''%E4%B8%AD%E6%96%87.txt\"}"
+```
+
+或用 here-doc 传入请求体，避免引号转义：
+
+```
+curl -s -X POST http://127.0.0.1:8080/safe-download-name \
+  -H 'Content-Type: application/json' --data @- <<'JSON'
+{"content_disposition": "attachment; filename*=utf-8''%E4%B8%AD%E6%96%87.txt"}
+JSON
+```
+
+#### 解析与回退规则
+
+1. **头部结构**：必须是 `disposition-type *( OWS ";" OWS parameter )`，
+   `disposition-type` 与参数名必须是合法 token；未加引号的参数值必须是
+   token，含特殊字符时用 quoted-string（支持 `\"`、`\\` 等 quoted-pair
+   转义）；拒绝 CR/LF（折行/头部注入）、未闭合引号、参数后杂散字节等，
+   结构非法返回 `422 malformed_content_disposition`。
+2. **优先 `filename*`**：严格按 RFC 5987 解析 `charset'language'value`，
+   仅接受 `UTF-8` 与 `ISO-8859-1`（大小写不敏感）字符集，`%HH` 百分号
+   序列必须成对且能按声明字符集解码，语言标签省略或形如 `en` /
+   `zh-CN`。任何不合规（未知字符集、错误百分号、非法 UTF-8、空值等）
+   都视为该参数缺失。
+3. **回退 `filename`**：`filename*` 缺失或无效时使用传统 `filename`：
+   token 值直接采用；quoted-string 按 RFC 6266 的历史兼容解释以
+   ISO-8859-1 还原字节。同名参数重复出现时，该参数名整体作废
+   （RFC 6266，不任选其一）。
+4. **清理为单一文件名**（按顺序）：
+   - 删除全部 C0/C1 控制字符（`U+0000-U+001F`、`U+007F-U+009F`，
+     含 NUL、tab、换行）；
+   - `\` 与 `/` 均按路径分隔符处理，只保留最后一段，剥离 POSIX 绝对/
+     相对路径、UNC 路径（`\\server\share\...`）与 Windows 路径前缀；
+     形如 `C:` 的 Windows 盘符同样剥离；
+   - 裁剪首尾 Unicode 空白；结果为空、`.` 或 `..` 时视为无效。
+5. `filename*` 与 `filename` 都缺失，或经解码/清理后都得不到有效名称时，
+   返回 `422 no_usable_filename`——调用方应改用自己生成的默认文件名。
+
+典型行为：
+
+| 输入头值 | `filename` | `source` | `sanitized` |
+| --- | --- | --- | --- |
+| `attachment; filename="a.bin"; filename*=utf-8''%E6%97%A5.zip` | `日.zip` | `filename_star` | false |
+| `attachment; filename="plain.tar"` | `plain.tar` | `filename` | false |
+| `attachment; filename*=utf-16''%41; filename="fb.log"` | `fb.log` | `filename` | false |
+| `attachment; filename="../../etc/passwd"` | `passwd` | `filename` | true |
+| `attachment; filename*=utf-8''C%3A%5CTemp%5Cx.docx` | `x.docx` | `filename_star` | true |
+| `attachment; filename=".."` | _422 `no_usable_filename`_ | — | — |
+| `attachment` | _422 `no_usable_filename`_ | — | — |
+
 ## 错误响应
 
 业务请求/语义错误统一返回 HTTP `422`：
@@ -510,10 +598,26 @@ envelope["signature"] = hmac.new(
 `/secure-request` 信封本身字段缺失或类型错误（如缺少 `signature`、
 `timestamp` 不是整数）同样返回 `422 invalid_request`。
 
+`/safe-download-name` 的语义错误同样为 HTTP `422`，统一结构
+`{"error": "<code>", "detail": [{"message": ..., "loc": "content_disposition"}]}`：
+
+| error | 含义 |
+| --- | --- |
+| `invalid_request` | 请求体字段错误（`content_disposition` 缺失、不是字符串、为空或超过 8192 字符） |
+| `malformed_content_disposition` | 头部结构非法（缺少 disposition 类型、参数名/值非法、quoted-string 未闭合、含 CR/LF、参数后杂散字节等） |
+| `no_usable_filename` | 头部可解析，但 `filename*` 与 `filename` 均缺失，或解码/清理后为空名、`.`/`..`、纯路径或仅含控制字符 |
+
 ## 本地开发（不使用 Docker）
 
 ```
 pip install -r requirements.txt
 export SECURE_REQUEST_KEYS='demo-key=0123456789abcdef0123456789abcdef'
 uvicorn app.main:app --reload --port 8080
+```
+
+运行测试（含 `/safe-download-name` 的编码、回退与路径清理用例）：
+
+```
+pip install -r requirements-dev.txt
+python -m pytest -q
 ```
